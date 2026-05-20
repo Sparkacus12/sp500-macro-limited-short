@@ -1,3 +1,4 @@
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -18,18 +19,18 @@ PRICE_PERIOD = "3y"
 MAX_LONGS = 3
 
 # Tactical hedge settings
-HEDGE_SIZE = 0.50                  # short 50% SPY when hedge is active
-LOOSE_CONDITIONS_Z = 1.00          # positive = unusually loose financial conditions
-SKEW_HIGH_Z = 1.00                 # elevated SKEW / crash-risk pricing
-SPY_MOMENTUM_EUPHORIA_Z = 1.00     # strong 3m equity momentum
-VIX_LOW_Z = -0.75                  # complacency / low vol
+HEDGE_SIZE = 0.50
+NFCI_LOOSE_Z = 1.00          # higher = looser conditions after sign flip
+SKEW_HIGH_Z = 1.00           # elevated SKEW = tail-risk concern / crowded optimism
+MOMENTUM_EUPHORIA_Z = 1.00   # strong SPY 3m momentum
+VIX_LOW_Z = -0.75            # unusually low VIX = complacency
 
-st.title("S&P 500 Long + Tactical Hedge Lab")
+st.title("S&P 500 Long + Tactical SPY Hedge Lab")
 
 st.caption(
     "Systematic research tool only, not investment advice. "
-    "The long book uses normalisation regime shifts, trend persistence and implied earnings-revision pressure. "
-    "The hedge is a tactical short SPY overlay triggered by loose financial conditions plus euphoric/complacent sentiment."
+    "Long book uses regime normalisation and implied earnings-revision pressure. "
+    "Hedge overlay shorts SPY when financial conditions are very loose and sentiment/complacency is elevated."
 )
 
 # ============================================================
@@ -65,8 +66,6 @@ MARKET_TICKERS = {
     "Rates": "TLT",
     "Dollar": "UUP",
     "Oil ETF": "USO",
-    "SKEW": "^SKEW",
-    "VIX": "^VIX",
     "Communication Services": "XLC",
     "Consumer Discretionary": "XLY",
     "Consumer Staples": "XLP",
@@ -94,6 +93,48 @@ def get_market_proxy_prices():
     return close.dropna(axis=1, how="all").ffill()
 
 
+@st.cache_data(ttl=60 * 60 * 6)
+def get_market_sentiment_data():
+    """
+    Pull SKEW, VIX and SPY separately because Yahoo can be unreliable
+    when index tickers are downloaded in a large batch.
+    """
+    tickers = {
+        "SPY": "SPY",
+        "VIX": "^VIX",
+        "SKEW": "^SKEW",
+    }
+
+    out = {}
+
+    for name, ticker in tickers.items():
+        try:
+            data = yf.download(
+                ticker,
+                period="5y",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+
+            if data is None or data.empty:
+                continue
+
+            close = data["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            close = close.dropna()
+
+            if len(close) > 50:
+                out[name] = close
+
+        except Exception:
+            pass
+
+    return out
+
+
 FRED_SERIES = {
     "industrial_production": "INDPRO",
     "retail_sales": "RSAFS",
@@ -113,7 +154,9 @@ FRED_SERIES = {
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_fred_data():
-    """Pull FRED CSVs directly. Avoids pandas-datareader dependency issues on Streamlit Cloud."""
+    """
+    Pull FRED CSVs directly, avoiding pandas-datareader dependency issues.
+    """
     end = pd.Timestamp.today()
     start = end - pd.DateOffset(years=5)
     series = {}
@@ -128,13 +171,13 @@ def get_fred_data():
             raw = raw.dropna(subset=["Date"])
             raw = raw[(raw["Date"] >= start) & (raw["Date"] <= end)]
             s = raw.set_index("Date")[name].dropna()
-            # Align daily and monthly series to month-end observations.
             s = s.resample("ME").last()
             series[name] = s
         except Exception:
             series[name] = pd.Series(dtype=float)
 
     return pd.DataFrame(series).sort_index().ffill()
+
 
 # ============================================================
 # CORE HELPERS
@@ -186,15 +229,22 @@ def vol_compression_for_ticker(ticker, prices):
         return 0.0
 
 
-def rolling_zscore_latest(series, lookback=252):
+def latest_zscore(series, window=252):
     s = series.dropna()
-    if len(s) < max(30, lookback // 2):
-        return 0.0
-    window = s.iloc[-lookback:] if len(s) >= lookback else s
-    std = window.std()
+    if len(s) < max(30, window // 2):
+        return np.nan
+
+    w = s.iloc[-window:] if len(s) >= window else s
+    std = w.std()
+
     if std == 0 or np.isnan(std):
-        return 0.0
-    return float((window.iloc[-1] - window.mean()) / std)
+        return np.nan
+
+    return float((w.iloc[-1] - w.mean()) / std)
+
+
+def rolling_zscore_latest(series, lookback=252):
+    return latest_zscore(series, lookback)
 
 
 def zscore_latest(series, lookback=36, transform="diff"):
@@ -220,10 +270,12 @@ def zscore_latest(series, lookback=36, transform="diff"):
 
     window = x.iloc[-lookback:] if len(x) >= lookback else x
     std = window.std()
+
     if std == 0 or np.isnan(std):
         return 0.0
 
     return float((window.iloc[-1] - window.mean()) / std)
+
 
 # ============================================================
 # FRED MACRO MODEL
@@ -254,13 +306,13 @@ def build_fred_macro_factor_scores(fred):
         zscore_latest(fred.get("ppi", pd.Series(dtype=float)), transform="diff"),
     ])
 
-    # More positive = easier/better financial conditions.
     financial_conditions = np.nanmean([
         -zscore_latest(fred.get("hy_spread", pd.Series(dtype=float)), transform="level"),
         -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level"),
     ])
 
-    # NFCI: lower/negative = looser conditions, so inverse level gives positive looseness.
+    # NFCI: lower/negative level = looser financial conditions.
+    # Sign-flipped so positive = unusually loose conditions.
     loose_conditions = -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level")
 
     liquidity = zscore_latest(fred.get("m2", pd.Series(dtype=float)), transform="yoy")
@@ -355,47 +407,45 @@ def implied_earnings_revision_score(row):
         + 10 * row["Combined macro earnings score"]
     )
 
+
 # ============================================================
 # HEDGE MODEL
 # ============================================================
 
-def hedge_signal_from_data(market_prices, fred_factor_scores):
+def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
     """
-    Contrarian SPY hedge.
-    Hedge is active when financial conditions are unusually loose and either:
-    - SKEW is elevated,
-    - SPY 3m momentum is euphoric,
-    - VIX is unusually low.
+    Contrarian hedge:
+    - financial conditions unusually loose, AND
+    - equity sentiment/complacency elevated.
+
+    Signals:
+      1. FRED NFCI looseness z-score
+      2. SKEW z-score
+      3. SPY 3m momentum z-score
+      4. VIX low z-score
     """
     loose_z = fred_factor_scores.get("Loose conditions", 0.0)
 
-    skew_z = 0.0
-    vix_z = 0.0
-    spy_mom_z = 0.0
+    skew_z = np.nan
+    vix_z = np.nan
+    spy_mom_z = np.nan
 
-    try:
-        skew = market_prices["^SKEW"].dropna()
-        skew_z = rolling_zscore_latest(skew, 252)
-    except Exception:
-        pass
+    if sentiment is not None and "SKEW" in sentiment:
+        skew_z = latest_zscore(sentiment["SKEW"], 252)
 
-    try:
-        vix = market_prices["^VIX"].dropna()
-        vix_z = rolling_zscore_latest(vix, 252)
-    except Exception:
-        pass
+    if sentiment is not None and "VIX" in sentiment:
+        vix_z = latest_zscore(sentiment["VIX"], 252)
 
-    try:
-        spy = market_prices["SPY"].dropna()
-        spy_3m = spy.pct_change(63).dropna()
-        spy_mom_z = rolling_zscore_latest(spy_3m, 252)
-    except Exception:
-        pass
+    if sentiment is not None and "SPY" in sentiment:
+        spy_3m = sentiment["SPY"].pct_change(63).dropna()
+        spy_mom_z = latest_zscore(spy_3m, 252)
 
-    loose_flag = loose_z > LOOSE_CONDITIONS_Z
-    skew_flag = skew_z > SKEW_HIGH_Z
-    euphoric_momentum_flag = spy_mom_z > SPY_MOMENTUM_EUPHORIA_Z
-    complacent_vix_flag = vix_z < VIX_LOW_Z
+    # If live SKEW/VIX not available, do not silently set them to zero.
+    skew_flag = bool(pd.notna(skew_z) and skew_z > SKEW_HIGH_Z)
+    euphoric_momentum_flag = bool(pd.notna(spy_mom_z) and spy_mom_z > MOMENTUM_EUPHORIA_Z)
+    complacent_vix_flag = bool(pd.notna(vix_z) and vix_z < VIX_LOW_Z)
+
+    loose_flag = bool(loose_z > NFCI_LOOSE_Z)
 
     hedge_on = bool(loose_flag and (skew_flag or euphoric_momentum_flag or complacent_vix_flag))
 
@@ -413,8 +463,22 @@ def hedge_signal_from_data(market_prices, fred_factor_scores):
     }
 
 
-def hedge_signal_at(market_prices_slice, fred_factor_scores):
-    return hedge_signal_from_data(market_prices_slice, fred_factor_scores)
+def hedge_signal_at(market_prices_slice, fred_factor_scores, full_sentiment, date):
+    """
+    Uses sentiment data only up to the signal date.
+    """
+    sentiment_slice = {}
+
+    for key, series in full_sentiment.items():
+        try:
+            s = series[series.index <= date]
+            if len(s) > 0:
+                sentiment_slice[key] = s
+        except Exception:
+            pass
+
+    return hedge_signal_from_data(market_prices_slice, fred_factor_scores, sentiment_slice)
+
 
 # ============================================================
 # BACKTEST HELPERS
@@ -456,23 +520,28 @@ def show_backtest(name, bt):
     c5.metric("Max drawdown", f"{max_drawdown:.2%}")
 
     st.line_chart(bt.set_index("Date")[["Equity curve", "Long book equity", "Hedge equity"]])
+
     st.markdown("**Recent portfolio history**")
     st.dataframe(bt.tail(30), use_container_width=True)
+
     return bt
+
 
 # ============================================================
 # LOAD DATA
 # ============================================================
 
-with st.spinner("Loading S&P 500, prices, market proxies and FRED macro data..."):
+with st.spinner("Loading S&P 500, prices, market proxies, sentiment and FRED macro data..."):
     sp500 = get_sp500()
     tickers = sp500["Ticker"].tolist()
     prices = get_prices(tickers)
     market_prices = get_market_proxy_prices()
+    sentiment = get_market_sentiment_data()
     fred = get_fred_data()
 
 fred_factor_scores = build_fred_macro_factor_scores(fred)
 available = [t for t in tickers if t in prices.columns]
+
 
 # ============================================================
 # MACRO / HEDGE DASHBOARD
@@ -486,26 +555,28 @@ fred_table = pd.DataFrame(
 
 st.dataframe(fred_table, use_container_width=True)
 
-current_hedge = hedge_signal_from_data(market_prices, fred_factor_scores)
+current_hedge = hedge_signal_from_data(market_prices, fred_factor_scores, sentiment)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Current hedge active", "Yes" if current_hedge["hedge_on"] else "No")
 c2.metric("Hedge size", f"{current_hedge['hedge_size']:.0%}")
 c3.metric("Loose conditions z", f"{current_hedge['loose_conditions_z']:.2f}")
-c4.metric("SKEW z-score", f"{current_hedge['skew_z']:.2f}")
+c4.metric("SKEW z-score", "n/a" if pd.isna(current_hedge["skew_z"]) else f"{current_hedge['skew_z']:.2f}")
 
-c1, c2 = st.columns(2)
-c1.metric("SPY 3m momentum z", f"{current_hedge['spy_3m_momentum_z']:.2f}")
-c2.metric("VIX z-score", f"{current_hedge['vix_z']:.2f}")
+c1, c2, c3 = st.columns(3)
+c1.metric("SPY 3m momentum z", "n/a" if pd.isna(current_hedge["spy_3m_momentum_z"]) else f"{current_hedge['spy_3m_momentum_z']:.2f}")
+c2.metric("VIX z-score", "n/a" if pd.isna(current_hedge["vix_z"]) else f"{current_hedge['vix_z']:.2f}")
+c3.metric("Sentiment series loaded", ", ".join(sentiment.keys()) if sentiment else "None")
 
 st.caption(
     "Hedge activates when FRED financial conditions are unusually loose and either SKEW is elevated, "
     "SPY 3m momentum is euphoric, or VIX is unusually low. The hedge is a short SPY overlay. "
-    "AAII is not included because it is not reliably available as a free machine-readable daily series."
+    "AAII is not included because it is not reliably available as a free machine-readable daily feed."
 )
 
+
 # ============================================================
-# CURRENT-DAY STOCK SCREEN
+# CURRENT STOCK SCREEN
 # ============================================================
 
 rows = []
@@ -568,7 +639,7 @@ long_screen = passed[
 st.subheader("Long book: current candidates")
 st.write(
     "Long candidates require normal 30-day returns, positive trend, positive 30-day return, "
-    "and positive implied earnings-revision pressure. The long book is no longer over-gated by broad defensive filters."
+    "and positive implied earnings-revision pressure. The long book is intentionally not over-gated by broad defensive filters."
 )
 
 display_cols = [
@@ -599,6 +670,7 @@ with c2:
     st.markdown("### Lowest implied revision pressure")
     st.dataframe(revision_table.tail(15).sort_values("Implied earnings revision score"), use_container_width=True)
 
+
 # ============================================================
 # STRATEGY BACKTEST
 # ============================================================
@@ -615,7 +687,7 @@ if not st.button("Run long book + tactical SPY hedge backtest"):
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
-def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, fred_factor_scores, lookback=30, p_threshold=0.10):
+def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, sentiment, fred_factor_scores, lookback=30, p_threshold=0.10):
     returns = prices.pct_change()
     spy_returns = market_prices["SPY"].pct_change()
 
@@ -629,7 +701,7 @@ def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, f
         signal_date = prices.index[i]
         trade_date = prices.index[i + 1]
 
-        # Exit existing longs.
+        # Exit existing longs
         for ticker in list(positions.keys()):
             current = prices[ticker].iloc[i - lookback:i].dropna()
             if len(current) < lookback:
@@ -662,6 +734,7 @@ def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, f
             )
 
             exit_reason = None
+
             if pval <= p_threshold:
                 exit_reason = "Normality broken"
             elif trend <= 0:
@@ -684,7 +757,7 @@ def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, f
                 })
                 del positions[ticker]
 
-        # Find new long entries.
+        # Find new long entries
         new_longs = []
 
         for ticker in prices.columns:
@@ -764,7 +837,7 @@ def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, f
         long_return = next_returns[long_tickers].mean() if long_tickers else 0.0
 
         market_slice = market_prices.iloc[:i]
-        hedge = hedge_signal_at(market_slice, fred_factor_scores)
+        hedge = hedge_signal_at(market_slice, fred_factor_scores, sentiment, signal_date)
         hedge_size = hedge["hedge_size"]
 
         spy_ret = spy_returns.loc[trade_date] if trade_date in spy_returns.index else 0.0
@@ -792,7 +865,7 @@ def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, f
 
 
 bt, trades = run_long_with_tactical_hedge_backtest(
-    prices, sp500, market_prices, fred_factor_scores, LOOKBACK, P_THRESHOLD
+    prices, sp500, market_prices, sentiment, fred_factor_scores, LOOKBACK, P_THRESHOLD
 )
 
 bt = show_backtest("Long normalisation strategy + tactical SPY hedge", bt)
