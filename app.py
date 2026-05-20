@@ -1,4 +1,3 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -8,33 +7,33 @@ from io import StringIO
 from scipy.stats import shapiro, linregress
 
 # ============================================================
-# Settings
+# SETTINGS
 # ============================================================
-st.set_page_config(page_title="S&P 500 Regime Strategy Lab", layout="wide")
+
+st.set_page_config(page_title="S&P 500 Long + Tactical Hedge Lab", layout="wide")
 
 LOOKBACK = 30
 P_THRESHOLD = 0.10
 PRICE_PERIOD = "3y"
-
 MAX_LONGS = 3
-MAX_SHORTS = 3
 
-SPY_MA_DAYS = 200
-HYG_MA_DAYS = 200
-BREADTH_MA_DAYS = 50
-MIN_BREADTH_FOR_LONGS = 0.45
-MAX_BREADTH_FOR_SHORTS = 0.50
+# Tactical hedge settings
+HEDGE_SIZE = 0.50                  # short 50% SPY when hedge is active
+LOOSE_CONDITIONS_Z = 1.00          # positive = unusually loose financial conditions
+SKEW_HIGH_Z = 1.00                 # elevated SKEW / crash-risk pricing
+SPY_MOMENTUM_EUPHORIA_Z = 1.00     # strong 3m equity momentum
+VIX_LOW_Z = -0.75                  # complacency / low vol
 
-st.title("S&P 500 Regime Strategy Lab")
+st.title("S&P 500 Long + Tactical Hedge Lab")
 
 st.caption(
     "Systematic research tool only, not investment advice. "
-    "Uses Yahoo Finance prices and FRED macro data. "
-    "Normality test is Shapiro-Wilk on rolling 30-day returns."
+    "The long book uses normalisation regime shifts, trend persistence and implied earnings-revision pressure. "
+    "The hedge is a tactical short SPY overlay triggered by loose financial conditions plus euphoric/complacent sentiment."
 )
 
 # ============================================================
-# Data loaders
+# DATA LOADERS
 # ============================================================
 
 @st.cache_data(ttl=60 * 60 * 12)
@@ -66,6 +65,8 @@ MARKET_TICKERS = {
     "Rates": "TLT",
     "Dollar": "UUP",
     "Oil ETF": "USO",
+    "SKEW": "^SKEW",
+    "VIX": "^VIX",
     "Communication Services": "XLC",
     "Consumer Discretionary": "XLY",
     "Consumer Staples": "XLP",
@@ -112,9 +113,9 @@ FRED_SERIES = {
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_fred_data():
+    """Pull FRED CSVs directly. Avoids pandas-datareader dependency issues on Streamlit Cloud."""
     end = pd.Timestamp.today()
     start = end - pd.DateOffset(years=5)
-
     series = {}
 
     for name, code in FRED_SERIES.items():
@@ -127,6 +128,7 @@ def get_fred_data():
             raw = raw.dropna(subset=["Date"])
             raw = raw[(raw["Date"] >= start) & (raw["Date"] <= end)]
             s = raw.set_index("Date")[name].dropna()
+            # Align daily and monthly series to month-end observations.
             s = s.resample("ME").last()
             series[name] = s
         except Exception:
@@ -134,9 +136,8 @@ def get_fred_data():
 
     return pd.DataFrame(series).sort_index().ffill()
 
-
 # ============================================================
-# Core helpers
+# CORE HELPERS
 # ============================================================
 
 def trend_score(series):
@@ -185,6 +186,17 @@ def vol_compression_for_ticker(ticker, prices):
         return 0.0
 
 
+def rolling_zscore_latest(series, lookback=252):
+    s = series.dropna()
+    if len(s) < max(30, lookback // 2):
+        return 0.0
+    window = s.iloc[-lookback:] if len(s) >= lookback else s
+    std = window.std()
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return float((window.iloc[-1] - window.mean()) / std)
+
+
 def zscore_latest(series, lookback=36, transform="diff"):
     s = series.dropna()
     if len(s) < 15:
@@ -208,102 +220,13 @@ def zscore_latest(series, lookback=36, transform="diff"):
 
     window = x.iloc[-lookback:] if len(x) >= lookback else x
     std = window.std()
-
     if std == 0 or np.isnan(std):
         return 0.0
 
     return float((window.iloc[-1] - window.mean()) / std)
 
-
 # ============================================================
-# Regime filters
-# ============================================================
-
-def spy_above_200dma(market_prices):
-    try:
-        spy = market_prices["SPY"].dropna()
-        if len(spy) < SPY_MA_DAYS:
-            return True
-        return bool(spy.iloc[-1] > spy.rolling(SPY_MA_DAYS).mean().iloc[-1])
-    except Exception:
-        return True
-
-
-def spy_below_200dma_at(market_prices, i):
-    try:
-        spy = market_prices["SPY"].iloc[:i].dropna()
-        if len(spy) < SPY_MA_DAYS:
-            return False
-        return bool(spy.iloc[-1] < spy.rolling(SPY_MA_DAYS).mean().iloc[-1])
-    except Exception:
-        return False
-
-
-def spy_above_200dma_at(market_prices, i):
-    try:
-        spy = market_prices["SPY"].iloc[:i].dropna()
-        if len(spy) < SPY_MA_DAYS:
-            return True
-        return bool(spy.iloc[-1] > spy.rolling(SPY_MA_DAYS).mean().iloc[-1])
-    except Exception:
-        return True
-
-
-def hyg_below_200dma_at(market_prices, i):
-    try:
-        hyg = market_prices["HYG"].iloc[:i].dropna()
-        if len(hyg) < HYG_MA_DAYS:
-            return False
-        return bool(hyg.iloc[-1] < hyg.rolling(HYG_MA_DAYS).mean().iloc[-1])
-    except Exception:
-        return False
-
-
-def breadth_above_ma(prices_slice, ma_days=BREADTH_MA_DAYS):
-    try:
-        if len(prices_slice) < ma_days:
-            return 0.5
-        latest = prices_slice.iloc[-1]
-        ma = prices_slice.rolling(ma_days).mean().iloc[-1]
-        valid = latest.notna() & ma.notna()
-        if valid.sum() == 0:
-            return 0.5
-        return float((latest[valid] > ma[valid]).mean())
-    except Exception:
-        return 0.5
-
-
-def risk_off_at(prices_slice, market_prices, i, fred_factor_scores):
-    """
-    Short book activates only when the market regime is hostile.
-
-    Conditions:
-    - SPY below 200dma, and
-    - either HYG below 200dma, weak breadth, or adverse FRED financial conditions.
-    """
-    spy_below = spy_below_200dma_at(market_prices, i)
-    hyg_below = hyg_below_200dma_at(market_prices, i)
-    breadth = breadth_above_ma(prices_slice)
-    weak_breadth = breadth < MAX_BREADTH_FOR_SHORTS
-    adverse_fred = fred_factor_scores.get("Financial conditions", 0) < 0
-
-    return bool(spy_below and (hyg_below or weak_breadth or adverse_fred))
-
-
-def risk_on_at(prices_slice, market_prices, i, fred_factor_scores):
-    """
-    Long book is allowed in constructive or neutral regimes, but avoids the worst breadth/credit breaks.
-    """
-    spy_above = spy_above_200dma_at(market_prices, i)
-    breadth = breadth_above_ma(prices_slice)
-    credit_ok = not hyg_below_200dma_at(market_prices, i)
-    fred_ok = fred_factor_scores.get("Financial conditions", 0) > -1.0
-
-    return bool((spy_above or breadth > MIN_BREADTH_FOR_LONGS) and credit_ok and fred_ok)
-
-
-# ============================================================
-# FRED macro model
+# FRED MACRO MODEL
 # ============================================================
 
 def build_fred_macro_factor_scores(fred):
@@ -316,6 +239,7 @@ def build_fred_macro_factor_scores(fred):
             "Dollar relief": 0.0,
             "Oil": 0.0,
             "Yield curve": 0.0,
+            "Loose conditions": 0.0,
         }
 
     growth = np.nanmean([
@@ -330,10 +254,14 @@ def build_fred_macro_factor_scores(fred):
         zscore_latest(fred.get("ppi", pd.Series(dtype=float)), transform="diff"),
     ])
 
+    # More positive = easier/better financial conditions.
     financial_conditions = np.nanmean([
         -zscore_latest(fred.get("hy_spread", pd.Series(dtype=float)), transform="level"),
         -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level"),
     ])
+
+    # NFCI: lower/negative = looser conditions, so inverse level gives positive looseness.
+    loose_conditions = -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level")
 
     liquidity = zscore_latest(fred.get("m2", pd.Series(dtype=float)), transform="yoy")
     dollar_relief = -zscore_latest(fred.get("dollar", pd.Series(dtype=float)), transform="diff")
@@ -353,6 +281,7 @@ def build_fred_macro_factor_scores(fred):
         "Dollar relief": float(np.nan_to_num(dollar_relief)),
         "Oil": float(np.nan_to_num(oil)),
         "Yield curve": float(np.nan_to_num(yield_curve)),
+        "Loose conditions": float(np.nan_to_num(loose_conditions)),
     }
 
 
@@ -417,14 +346,6 @@ def combined_macro_earnings_score(sector, ticker, prices, market_prices, fred_fa
     return total, fred_score, mkt_score
 
 
-def score_to_signal(score):
-    if score > 2:
-        return "Positive macro-earnings backdrop"
-    if score < -2:
-        return "Negative macro-earnings backdrop"
-    return "Neutral"
-
-
 def implied_earnings_revision_score(row):
     return (
         40 * row["Relative strength vs sector"]
@@ -434,9 +355,69 @@ def implied_earnings_revision_score(row):
         + 10 * row["Combined macro earnings score"]
     )
 
+# ============================================================
+# HEDGE MODEL
+# ============================================================
+
+def hedge_signal_from_data(market_prices, fred_factor_scores):
+    """
+    Contrarian SPY hedge.
+    Hedge is active when financial conditions are unusually loose and either:
+    - SKEW is elevated,
+    - SPY 3m momentum is euphoric,
+    - VIX is unusually low.
+    """
+    loose_z = fred_factor_scores.get("Loose conditions", 0.0)
+
+    skew_z = 0.0
+    vix_z = 0.0
+    spy_mom_z = 0.0
+
+    try:
+        skew = market_prices["^SKEW"].dropna()
+        skew_z = rolling_zscore_latest(skew, 252)
+    except Exception:
+        pass
+
+    try:
+        vix = market_prices["^VIX"].dropna()
+        vix_z = rolling_zscore_latest(vix, 252)
+    except Exception:
+        pass
+
+    try:
+        spy = market_prices["SPY"].dropna()
+        spy_3m = spy.pct_change(63).dropna()
+        spy_mom_z = rolling_zscore_latest(spy_3m, 252)
+    except Exception:
+        pass
+
+    loose_flag = loose_z > LOOSE_CONDITIONS_Z
+    skew_flag = skew_z > SKEW_HIGH_Z
+    euphoric_momentum_flag = spy_mom_z > SPY_MOMENTUM_EUPHORIA_Z
+    complacent_vix_flag = vix_z < VIX_LOW_Z
+
+    hedge_on = bool(loose_flag and (skew_flag or euphoric_momentum_flag or complacent_vix_flag))
+
+    return {
+        "hedge_on": hedge_on,
+        "hedge_size": HEDGE_SIZE if hedge_on else 0.0,
+        "loose_conditions_z": loose_z,
+        "skew_z": skew_z,
+        "spy_3m_momentum_z": spy_mom_z,
+        "vix_z": vix_z,
+        "loose_flag": loose_flag,
+        "skew_flag": skew_flag,
+        "euphoric_momentum_flag": euphoric_momentum_flag,
+        "complacent_vix_flag": complacent_vix_flag,
+    }
+
+
+def hedge_signal_at(market_prices_slice, fred_factor_scores):
+    return hedge_signal_from_data(market_prices_slice, fred_factor_scores)
 
 # ============================================================
-# Backtest helpers
+# BACKTEST HELPERS
 # ============================================================
 
 def performance_stats(bt):
@@ -445,12 +426,8 @@ def performance_stats(bt):
         return bt, np.nan, np.nan, np.nan, np.nan, np.nan
 
     bt["Equity curve"] = (1 + bt["Return"]).cumprod()
-
-    if "Long book return" in bt.columns:
-        bt["Long book equity"] = (1 + bt["Long book return"]).cumprod()
-
-    if "Short book return" in bt.columns:
-        bt["Short book equity"] = (1 + bt["Short book return"]).cumprod()
+    bt["Long book equity"] = (1 + bt["Long book return"]).cumprod()
+    bt["Hedge equity"] = (1 + bt["Hedge return"]).cumprod()
 
     total_return = bt["Equity curve"].iloc[-1] - 1
     annualised_return = bt["Equity curve"].iloc[-1] ** (252 / len(bt)) - 1
@@ -478,20 +455,13 @@ def show_backtest(name, bt):
     c4.metric("Sharpe ratio", f"{sharpe:.2f}")
     c5.metric("Max drawdown", f"{max_drawdown:.2%}")
 
-    chart_cols = ["Equity curve"]
-    if "Long book equity" in bt.columns:
-        chart_cols.append("Long book equity")
-    if "Short book equity" in bt.columns:
-        chart_cols.append("Short book equity")
-
-    st.line_chart(bt.set_index("Date")[chart_cols])
+    st.line_chart(bt.set_index("Date")[["Equity curve", "Long book equity", "Hedge equity"]])
     st.markdown("**Recent portfolio history**")
     st.dataframe(bt.tail(30), use_container_width=True)
     return bt
 
-
 # ============================================================
-# Load data
+# LOAD DATA
 # ============================================================
 
 with st.spinner("Loading S&P 500, prices, market proxies and FRED macro data..."):
@@ -504,9 +474,8 @@ with st.spinner("Loading S&P 500, prices, market proxies and FRED macro data..."
 fred_factor_scores = build_fred_macro_factor_scores(fred)
 available = [t for t in tickers if t in prices.columns]
 
-
 # ============================================================
-# FRED dashboard and regime status
+# MACRO / HEDGE DASHBOARD
 # ============================================================
 
 st.subheader("FRED macro regime dashboard")
@@ -517,24 +486,26 @@ fred_table = pd.DataFrame(
 
 st.dataframe(fred_table, use_container_width=True)
 
-current_breadth = breadth_above_ma(prices)
-current_spy_above = spy_above_200dma(market_prices)
-current_short_regime = risk_off_at(prices, market_prices, len(market_prices), fred_factor_scores)
+current_hedge = hedge_signal_from_data(market_prices, fred_factor_scores)
 
-c1, c2, c3 = st.columns(3)
-c1.metric("SPY above 200dma", "Yes" if current_spy_above else "No")
-c2.metric("S&P 500 breadth > 50dma", f"{current_breadth:.1%}")
-c3.metric("Short book active regime", "Yes" if current_short_regime else "No")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Current hedge active", "Yes" if current_hedge["hedge_on"] else "No")
+c2.metric("Hedge size", f"{current_hedge['hedge_size']:.0%}")
+c3.metric("Loose conditions z", f"{current_hedge['loose_conditions_z']:.2f}")
+c4.metric("SKEW z-score", f"{current_hedge['skew_z']:.2f}")
+
+c1, c2 = st.columns(2)
+c1.metric("SPY 3m momentum z", f"{current_hedge['spy_3m_momentum_z']:.2f}")
+c2.metric("VIX z-score", f"{current_hedge['vix_z']:.2f}")
 
 st.caption(
-    "Shorts are only allowed when SPY is below its 200dma and at least one additional risk-off condition is present: "
-    "HYG below 200dma, weak breadth, or adverse FRED financial conditions. "
-    "Longs avoid severe breadth/credit deterioration."
+    "Hedge activates when FRED financial conditions are unusually loose and either SKEW is elevated, "
+    "SPY 3m momentum is euphoric, or VIX is unusually low. The hedge is a short SPY overlay. "
+    "AAII is not included because it is not reliably available as a free machine-readable daily series."
 )
 
-
 # ============================================================
-# Current-day screen
+# CURRENT-DAY STOCK SCREEN
 # ============================================================
 
 rows = []
@@ -574,59 +545,30 @@ macro_parts = df.apply(
 df["Combined macro earnings score"] = [x[0] for x in macro_parts]
 df["FRED sector macro score"] = [x[1] for x in macro_parts]
 df["Market-implied macro score"] = [x[2] for x in macro_parts]
-df["Macro signal"] = df["Combined macro earnings score"].apply(score_to_signal)
 
 market_30d_return = pct_return(market_prices, "SPY")
-
 
 def sector_relative_strength(row):
     sector_etf = MARKET_TICKERS.get(row["GICS Sector"])
     sector_ret = pct_return(market_prices, sector_etf)
     return row["30d return"] - sector_ret
 
-
 df["Relative strength vs market"] = df["30d return"] - market_30d_return
 df["Relative strength vs sector"] = df.apply(sector_relative_strength, axis=1)
 df["Implied earnings revision score"] = df.apply(implied_earnings_revision_score, axis=1)
 
-df["Implied earnings revision signal"] = np.where(
-    df["Implied earnings revision score"] > 2,
-    "Likely upward revision pressure",
-    np.where(
-        df["Implied earnings revision score"] < -2,
-        "Likely downward revision pressure",
-        "Neutral",
-    ),
-)
-
-
-# ============================================================
-# Strategy 1: screen only
-# ============================================================
-
 passed = df[df["Pass normality"]]
 
-long_candidates = passed[
+long_screen = passed[
     (passed["Trend score"] > 0)
     & (passed["30d return"] > 0)
-    & (passed["Combined macro earnings score"] > 0)
     & (passed["Implied earnings revision score"] > 0)
-]
+].sort_values("Implied earnings revision score", ascending=False).head(MAX_LONGS)
 
-short_candidates = passed[
-    (passed["Trend score"] < 0)
-    & (passed["30d return"] < 0)
-    & (passed["Combined macro earnings score"] < 0)
-    & (passed["Implied earnings revision score"] < 0)
-]
-
-buys = long_candidates.sort_values("Implied earnings revision score", ascending=False).head(MAX_LONGS)
-sells = short_candidates.sort_values("Implied earnings revision score", ascending=True).head(MAX_SHORTS)
-
-st.subheader("Strategy 1: Core daily trend screen â no backtest")
+st.subheader("Long book: current candidates")
 st.write(
-    "Longs require normal returns, positive trend, positive return, positive macro score and positive implied revision score. "
-    "Shorts require the reverse, but the short book should only be used when the regime filter is active."
+    "Long candidates require normal 30-day returns, positive trend, positive 30-day return, "
+    "and positive implied earnings-revision pressure. The long book is no longer over-gated by broad defensive filters."
 )
 
 display_cols = [
@@ -634,99 +576,9 @@ display_cols = [
     "Normality p-value", "FRED sector macro score", "Market-implied macro score",
     "Combined macro earnings score", "Relative strength vs sector",
     "Vol compression", "Implied earnings revision score",
-    "Implied earnings revision signal",
 ]
 
-c1, c2 = st.columns(2)
-
-with c1:
-    st.markdown("### Long candidates")
-    st.dataframe(buys[display_cols], use_container_width=True)
-
-with c2:
-    st.markdown("### Short candidates")
-    if current_short_regime:
-        st.dataframe(sells[display_cols], use_container_width=True)
-    else:
-        st.info("Short regime filter is OFF. Short candidates are shown for research only.")
-        st.dataframe(sells[display_cols], use_container_width=True)
-
-
-# ============================================================
-# Strategy 2 watchlist
-# ============================================================
-
-st.subheader("Strategy 2: Trend-break watchlist")
-
-down_breaks = []
-up_breaks = []
-
-for ticker in available:
-    s = prices[ticker].dropna()
-    if len(s) < LOOKBACK + 2:
-        continue
-
-    prior = s.iloc[-LOOKBACK - 1:-1]
-    current = s.iloc[-LOOKBACK:]
-
-    prior_p = normality_pvalue(prior)
-    current_p = normality_pvalue(current)
-    prior_trend = trend_score(prior)
-    last_move = s.iloc[-1] / s.iloc[-2] - 1
-
-    if np.isnan(prior_p) or np.isnan(current_p) or np.isnan(prior_trend):
-        continue
-
-    if prior_trend > 0 and prior_p > P_THRESHOLD and current_p <= P_THRESHOLD and last_move < 0:
-        down_breaks.append({
-            "Ticker": ticker,
-            "t-1 trend score": prior_trend,
-            "Last-day move": last_move,
-            "t-1 p-value": prior_p,
-            "Current p-value": current_p,
-        })
-
-    if prior_trend < 0 and prior_p > P_THRESHOLD and current_p <= P_THRESHOLD and last_move > 0:
-        up_breaks.append({
-            "Ticker": ticker,
-            "t-1 trend score": prior_trend,
-            "Last-day move": last_move,
-            "t-1 p-value": prior_p,
-            "Current p-value": current_p,
-        })
-
-c1, c2 = st.columns(2)
-
-with c1:
-    st.markdown("### Possible sells: positive trend broken by downside move")
-    if down_breaks:
-        ddf = pd.DataFrame(down_breaks).merge(sp500, on="Ticker", how="left")
-        ddf = ddf.merge(
-            df[["Ticker", "Implied earnings revision score", "Combined macro earnings score"]],
-            on="Ticker",
-            how="left",
-        )
-        st.dataframe(ddf, use_container_width=True)
-    else:
-        st.write("No downside break candidates today.")
-
-with c2:
-    st.markdown("### Possible buys: negative trend broken by upside move")
-    if up_breaks:
-        udf = pd.DataFrame(up_breaks).merge(sp500, on="Ticker", how="left")
-        udf = udf.merge(
-            df[["Ticker", "Implied earnings revision score", "Combined macro earnings score"]],
-            on="Ticker",
-            how="left",
-        )
-        st.dataframe(udf, use_container_width=True)
-    else:
-        st.write("No upside break candidates today.")
-
-
-# ============================================================
-# Earnings revision overlay
-# ============================================================
+st.dataframe(long_screen[display_cols], use_container_width=True)
 
 st.subheader("Implied earnings revision overlay")
 
@@ -737,99 +589,36 @@ revision_table = df[[
     "FRED sector macro score", "Market-implied macro score",
     "Combined macro earnings score",
     "Implied earnings revision score",
-    "Implied earnings revision signal",
 ]].sort_values("Implied earnings revision score", ascending=False)
 
 c1, c2 = st.columns(2)
-
 with c1:
     st.markdown("### Highest implied upward revision pressure")
     st.dataframe(revision_table.head(15), use_container_width=True)
-
 with c2:
-    st.markdown("### Highest implied downward revision pressure")
-    st.dataframe(
-        revision_table.tail(15).sort_values("Implied earnings revision score"),
-        use_container_width=True,
-    )
-
+    st.markdown("### Lowest implied revision pressure")
+    st.dataframe(revision_table.tail(15).sort_values("Implied earnings revision score"), use_container_width=True)
 
 # ============================================================
-# Backtests
+# STRATEGY BACKTEST
 # ============================================================
 
-st.subheader("Backtests")
+st.subheader("Backtest")
 st.write(
-    "Strategy 2 and Strategy 3 backtests use conditional shorts. "
-    "Shorts are only active in risk-off regimes. Longs are filtered to avoid severe breadth/credit deterioration."
+    "This backtest runs the long normalisation strategy and overlays a tactical SPY hedge "
+    "when financial conditions are very loose and sentiment/complacency is elevated."
 )
 
-if not st.button("Run Strategy 2 and Strategy 3 backtests"):
-    st.info("Click to run the backtests. First run may take a few minutes.")
+if not st.button("Run long book + tactical SPY hedge backtest"):
+    st.info("Click to run the backtest. First run may take a few minutes.")
     st.stop()
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
-def run_trend_break_backtest(prices, market_prices, fred_factor_scores, lookback=30, p_threshold=0.10):
+def run_long_with_tactical_hedge_backtest(prices, sector_table, market_prices, fred_factor_scores, lookback=30, p_threshold=0.10):
     returns = prices.pct_change()
-    results = []
+    spy_returns = market_prices["SPY"].pct_change()
 
-    for i in range(lookback + 2, len(prices) - 1):
-        trade_date = prices.index[i + 1]
-        prices_slice = prices.iloc[:i]
-        allow_longs = risk_on_at(prices_slice, market_prices, i, fred_factor_scores)
-        allow_shorts = risk_off_at(prices_slice, market_prices, i, fred_factor_scores)
-
-        longs = []
-        shorts = []
-
-        for ticker in prices.columns:
-            prior = prices[ticker].iloc[i - lookback - 1:i - 1].dropna()
-            current = prices[ticker].iloc[i - lookback:i].dropna()
-
-            if len(prior) < lookback or len(current) < lookback:
-                continue
-
-            prior_p = normality_pvalue(prior)
-            current_p = normality_pvalue(current)
-            prior_trend = trend_score(prior)
-            last_move = prices[ticker].iloc[i - 1] / prices[ticker].iloc[i - 2] - 1
-
-            if np.isnan(prior_p) or np.isnan(current_p) or np.isnan(prior_trend):
-                continue
-
-            if allow_shorts and prior_trend > 0 and prior_p > p_threshold and current_p <= p_threshold and last_move < 0:
-                shorts.append(ticker)
-
-            if allow_longs and prior_trend < 0 and prior_p > p_threshold and current_p <= p_threshold and last_move > 0:
-                longs.append(ticker)
-
-        next_returns = returns.loc[trade_date]
-
-        long_return = next_returns[longs].mean() if longs else 0
-        short_return = next_returns[shorts].mean() if shorts else 0
-
-        results.append({
-            "Date": trade_date,
-            "Return": long_return - short_return,
-            "Long book return": long_return,
-            "Short book return": -short_return,
-            "Short underlying return": short_return,
-            "Short regime active": allow_shorts,
-            "Long regime active": allow_longs,
-            "Breadth": breadth_above_ma(prices_slice),
-            "Number longs": len(longs),
-            "Number shorts": len(shorts),
-            "Longs": ", ".join(longs),
-            "Shorts": ", ".join(shorts),
-        })
-
-    return pd.DataFrame(results)
-
-
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
-def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_scores, lookback=30, p_threshold=0.10):
-    returns = prices.pct_change()
     positions = {}
     results = []
     trade_log = []
@@ -839,12 +628,8 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
     for i in range(lookback + 2, len(prices) - 1):
         signal_date = prices.index[i]
         trade_date = prices.index[i + 1]
-        prices_slice = prices.iloc[:i]
 
-        allow_longs = risk_on_at(prices_slice, market_prices, i, fred_factor_scores)
-        allow_shorts = risk_off_at(prices_slice, market_prices, i, fred_factor_scores)
-
-        # Exit existing positions
+        # Exit existing longs.
         for ticker in list(positions.keys()):
             current = prices[ticker].iloc[i - lookback:i].dropna()
             if len(current) < lookback:
@@ -876,30 +661,19 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
                 + 10 * macro_total
             )
 
-            side = positions[ticker]
             exit_reason = None
-
             if pval <= p_threshold:
                 exit_reason = "Normality broken"
-            elif side == "LONG" and trend <= 0:
+            elif trend <= 0:
                 exit_reason = "Positive trend broken"
-            elif side == "SHORT" and trend >= 0:
-                exit_reason = "Negative trend broken"
-            elif side == "LONG" and implied_score <= 0:
-                exit_reason = "Implied revision score no longer supports long"
-            elif side == "SHORT" and implied_score >= 0:
-                exit_reason = "Implied revision score no longer supports short"
-            elif side == "SHORT" and not allow_shorts:
-                exit_reason = "Short regime no longer active"
-            elif side == "LONG" and not allow_longs:
-                exit_reason = "Long regime no longer active"
+            elif implied_score <= 0:
+                exit_reason = "Implied revision score no longer positive"
 
             if exit_reason:
                 trade_log.append({
                     "Date": signal_date,
                     "Ticker": ticker,
                     "Action": "EXIT",
-                    "Side": side,
                     "Reason": exit_reason,
                     "P-value": pval,
                     "Trend": trend,
@@ -907,14 +681,11 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
                     "FRED macro score": fred_score,
                     "Market macro score": market_score,
                     "Combined macro score": macro_total,
-                    "Short regime active": allow_shorts,
-                    "Long regime active": allow_longs,
                 })
                 del positions[ticker]
 
-        # Find new entries
+        # Find new long entries.
         new_longs = []
-        new_shorts = []
 
         for ticker in prices.columns:
             if ticker in positions:
@@ -959,22 +730,10 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
                 + 10 * macro_total
             )
 
-            if allow_longs and trend > 0 and ret_30d > 0 and macro_total > 0 and implied_score > 0:
+            if trend > 0 and ret_30d > 0 and implied_score > 0:
                 new_longs.append({
                     "Ticker": ticker,
                     "Rank score": implied_score,
-                    "P-value": current_p,
-                    "Trend": trend,
-                    "Implied revision score": implied_score,
-                    "FRED macro score": fred_score,
-                    "Market macro score": market_score,
-                    "Combined macro score": macro_total,
-                })
-
-            elif allow_shorts and trend < 0 and ret_30d < 0 and macro_total < 0 and implied_score < 0:
-                new_shorts.append({
-                    "Ticker": ticker,
-                    "Rank score": abs(implied_score),
                     "P-value": current_p,
                     "Trend": trend,
                     "Implied revision score": implied_score,
@@ -991,7 +750,6 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
                     "Date": signal_date,
                     "Ticker": row["Ticker"],
                     "Action": "ENTER",
-                    "Side": "LONG",
                     "Reason": "Normalised with positive trend and upward revision pressure",
                     "P-value": row["P-value"],
                     "Trend": row["Trend"],
@@ -999,98 +757,83 @@ def run_normalisation_backtest(prices, sector_table, market_prices, fred_factor_
                     "FRED macro score": row["FRED macro score"],
                     "Market macro score": row["Market macro score"],
                     "Combined macro score": row["Combined macro score"],
-                    "Short regime active": allow_shorts,
-                    "Long regime active": allow_longs,
-                })
-
-        if new_shorts:
-            new_shorts = pd.DataFrame(new_shorts).sort_values("Rank score", ascending=False).head(MAX_SHORTS)
-            for _, row in new_shorts.iterrows():
-                positions[row["Ticker"]] = "SHORT"
-                trade_log.append({
-                    "Date": signal_date,
-                    "Ticker": row["Ticker"],
-                    "Action": "ENTER",
-                    "Side": "SHORT",
-                    "Reason": "Normalised with negative trend and downward revision pressure in risk-off regime",
-                    "P-value": row["P-value"],
-                    "Trend": row["Trend"],
-                    "Implied revision score": row["Implied revision score"],
-                    "FRED macro score": row["FRED macro score"],
-                    "Market macro score": row["Market macro score"],
-                    "Combined macro score": row["Combined macro score"],
-                    "Short regime active": allow_shorts,
-                    "Long regime active": allow_longs,
                 })
 
         next_returns = returns.loc[trade_date]
+        long_tickers = list(positions.keys())
+        long_return = next_returns[long_tickers].mean() if long_tickers else 0.0
 
-        long_tickers = [t for t, side in positions.items() if side == "LONG"]
-        short_tickers = [t for t, side in positions.items() if side == "SHORT"]
+        market_slice = market_prices.iloc[:i]
+        hedge = hedge_signal_at(market_slice, fred_factor_scores)
+        hedge_size = hedge["hedge_size"]
 
-        long_return = next_returns[long_tickers].mean() if long_tickers else 0
-        short_return = next_returns[short_tickers].mean() if short_tickers else 0
+        spy_ret = spy_returns.loc[trade_date] if trade_date in spy_returns.index else 0.0
+        hedge_return = -hedge_size * spy_ret
+
+        portfolio_return = long_return + hedge_return
 
         results.append({
             "Date": trade_date,
-            "Return": long_return - short_return,
+            "Return": portfolio_return,
             "Long book return": long_return,
-            "Short book return": -short_return,
-            "Short underlying return": short_return,
-            "Short regime active": allow_shorts,
-            "Long regime active": allow_longs,
-            "Breadth": breadth_above_ma(prices_slice),
+            "Hedge return": hedge_return,
+            "SPY return": spy_ret,
+            "Hedge active": hedge["hedge_on"],
+            "Hedge size": hedge_size,
+            "Loose conditions z": hedge["loose_conditions_z"],
+            "SKEW z": hedge["skew_z"],
+            "SPY 3m momentum z": hedge["spy_3m_momentum_z"],
+            "VIX z": hedge["vix_z"],
             "Number longs": len(long_tickers),
-            "Number shorts": len(short_tickers),
             "Longs": ", ".join(long_tickers),
-            "Shorts": ", ".join(short_tickers),
         })
 
     return pd.DataFrame(results), pd.DataFrame(trade_log)
 
 
-bt2 = run_trend_break_backtest(prices, market_prices, fred_factor_scores, LOOKBACK, P_THRESHOLD)
-bt2 = show_backtest("Strategy 2: Conditional trend-break reversal backtest", bt2)
-
-bt3, trades3 = run_normalisation_backtest(
+bt, trades = run_long_with_tactical_hedge_backtest(
     prices, sp500, market_prices, fred_factor_scores, LOOKBACK, P_THRESHOLD
 )
-bt3 = show_backtest("Strategy 3: Conditional normalisation regime shift, hold until break", bt3)
 
-st.markdown("### Strategy 3 long book vs short book")
-if bt3 is not None and not bt3.empty:
-    book_cols = [
+bt = show_backtest("Long normalisation strategy + tactical SPY hedge", bt)
+
+st.markdown("### Portfolio history")
+if bt is not None and not bt.empty:
+    cols = [
         "Date",
-        "Long book return",
-        "Short book return",
         "Return",
-        "Short regime active",
-        "Long regime active",
-        "Breadth",
+        "Long book return",
+        "Hedge return",
+        "SPY return",
+        "Hedge active",
+        "Hedge size",
+        "Loose conditions z",
+        "SKEW z",
+        "SPY 3m momentum z",
+        "VIX z",
         "Number longs",
-        "Number shorts",
         "Longs",
-        "Shorts",
     ]
-    st.dataframe(bt3[book_cols].tail(100), use_container_width=True)
+    st.dataframe(bt[cols].tail(100), use_container_width=True)
 
-    csv = bt3[book_cols].to_csv(index=False).encode("utf-8")
+    csv = bt[cols].to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download Strategy 3 portfolio history as CSV",
+        label="Download portfolio history as CSV",
         data=csv,
-        file_name="strategy_3_portfolio_history.csv",
+        file_name="long_with_tactical_hedge_history.csv",
         mime="text/csv",
     )
 
-st.markdown("### Strategy 3 trade log")
-if trades3.empty:
-    st.write("No Strategy 3 trades.")
+st.markdown("### Trade log")
+if trades.empty:
+    st.write("No trades.")
 else:
-    st.dataframe(trades3.tail(100), use_container_width=True)
-    csv_trades = trades3.to_csv(index=False).encode("utf-8")
+    st.dataframe(trades.tail(100), use_container_width=True)
+
+    csv_trades = trades.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download Strategy 3 trade log as CSV",
+        label="Download trade log as CSV",
         data=csv_trades,
-        file_name="strategy_3_trade_log.csv",
+        file_name="long_with_tactical_hedge_trade_log.csv",
         mime="text/csv",
     )
